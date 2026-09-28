@@ -16,6 +16,11 @@ using Socket = SOCKET;
 using Socket = int;
 #endif
 
+// UDP-сервер игры. Принимает команды клиентов (формат — в common.hpp),
+// проверяет их и отвечает текстовым подтверждением тому, кто прислал
+// команду. Состояния игры и списка клиентов сервер пока не хранит: каждая
+// датаграмма обрабатывается независимо.
+
 constexpr int PORT = 54000;
 
 void closeSocket(Socket socket) {
@@ -62,6 +67,8 @@ int main() {
 
     std::cout << "UDP server started on port " << PORT << "\n";
 
+    // Некорректная датаграмма только журналируется; ответ на неё не
+    // отправляется.
     auto dropDatagram = [&log](const sockaddr_in& from, int size, ParseError error) {
         std::cerr << "[DROP] from=" << endpointToString(from)
                   << " size=" << size
@@ -76,6 +83,7 @@ int main() {
     while (true) {
         uint8_t buffer[MAX_DATAGRAM_SIZE];
 
+        // Адрес отправителя: на него уйдёт ответ.
         sockaddr_in clientAddress{};
 #ifdef _WIN32
         int addressLength = sizeof(clientAddress);
@@ -97,6 +105,7 @@ int main() {
             continue;
         }
 
+        // Сначала проверяется заголовок, затем в ветке по типу — payload.
         auto parsed = parsePacket(buffer, static_cast<size_t>(received));
         if (auto* error = std::get_if<ParseError>(&parsed)) {
             dropDatagram(clientAddress, received, *error);
@@ -149,6 +158,8 @@ int main() {
                 << " response=\"" << response << "\"\n";
         }
 
+        // Ответ повторяет тип и sequence запроса, чтобы клиент мог найти
+        // команду, на которую он пришёл.
         auto responsePacket = serializeTextResponse(packet.header.type, sequence, response);
 
         sendto(

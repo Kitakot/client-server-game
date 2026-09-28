@@ -22,6 +22,12 @@ using Socket = int;
 
 using Clock = std::chrono::steady_clock;
 
+// UDP-клиент игры. Работает по ходам длиной TURN_DURATION: в начале хода
+// отправляет команды серверу (формат — в common.hpp), а до конца хода
+// принимает ответы. Ответ сопоставляется с командой по sequence; команда без
+// ответа дольше RESPONSE_TIMEOUT считается потерянной и повторно не
+// отправляется.
+
 constexpr int SERVER_PORT = 54000;
 constexpr auto RESPONSE_TIMEOUT = std::chrono::seconds(2);
 constexpr auto TURN_DURATION = std::chrono::seconds(1);
@@ -59,6 +65,9 @@ bool sameEndpoint(const sockaddr_in& a, const sockaddr_in& b) {
     return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
 }
 
+// Читает одну датаграмму и засчитывает её как ответ, только если она
+// пришла от сервера, корректно разобрана, её sequence есть среди ожидающих
+// команд и тип совпадает с типом отправленной команды.
 void receiveResponse(
     Socket clientSocket,
     const sockaddr_in& expectedServer,
@@ -120,6 +129,9 @@ void receiveResponse(
     pending.erase(it);
 }
 
+// Забывает команды, ответ на которые не пришёл за RESPONSE_TIMEOUT.
+// Повторной отправки нет: UDP не гарантирует доставку, и потерянная
+// команда просто пропадает.
 void expireTimedOut(std::map<uint16_t, PendingCommand>& pending, Clock::time_point now) {
     for (auto it = pending.begin(); it != pending.end();) {
         if (now - it->second.sentAt > RESPONSE_TIMEOUT) {
@@ -191,6 +203,8 @@ int main() {
     std::cout << "Connected to UDP server on port "
               << SERVER_PORT << "\n";
 
+    // sequence растёт с каждым отправленным пакетом (после 65535 начнётся
+    // с 0). pending — команды, ждущие ответа, по их sequence.
     uint16_t sequence = 1;
     int currentTurn = 1;
     std::map<uint16_t, PendingCommand> pending;
@@ -202,6 +216,7 @@ int main() {
         const auto turnStart = Clock::now();
         std::cout << "\n--- Turn " << currentTurn << " ---\n";
 
+        // Каждый ход юнит перемещается, каждый третий ход ещё и атакует.
         UnitMove moveCommand{
             playerUnitId,
             currentTurn * 2,

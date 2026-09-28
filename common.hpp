@@ -9,12 +9,28 @@
 #include <variant>
 #include <vector>
 
+// Протокол общения клиента и сервера поверх UDP. Соединения нет: клиент
+// шлёт команду одной датаграммой, сервер проверяет её и отвечает одной
+// датаграммой с тем же packetType и sequenceNumber, по которым клиент
+// сопоставляет ответ с запросом. Некорректные датаграммы сервер молча
+// отбрасывает, без ответа.
+//
 // Формат датаграммы (все многобайтовые поля в сетевом порядке, big-endian):
-//   0  u8  packetType
-//   1  u16 sequenceNumber
-//   3  u16 payloadSize
-//   5  u16 protocolVersion
+//   0  u8  packetType       CommandType: 1 = UNIT_MOVE, 2 = UNIT_ATTACK
+//   1  u16 sequenceNumber   номер пакета у клиента; в ответе — номер запроса
+//   3  u16 payloadSize      длина payload в байтах
+//   5  u16 protocolVersion  PROTOCOL_VERSION
 //   7  payload[payloadSize]
+// Вся датаграмма не длиннее MAX_DATAGRAM_SIZE.
+//
+// Payload запросов:
+//   UNIT_MOVE   (12 байт): i32 unitId, i32 targetX, i32 targetY
+//   UNIT_ATTACK  (8 байт): i32 attackerId, i32 targetId
+// Payload ответа сервера — ASCII-текст без завершающего нуля.
+//
+// Пример: UNIT_MOVE, sequence=1, юнит 1 в точку (2, 1) — 19 байт:
+//   01 | 00 01 | 00 0C | 00 01 | 00 00 00 01 | 00 00 00 02 | 00 00 00 01
+//
 // Структуры никогда не копируются в буфер целиком: каждое поле пишется и
 // читается явно, поэтому формат не зависит от выравнивания и порядка байтов
 // платформы.
@@ -220,6 +236,9 @@ struct Packet {
     const uint8_t* payload;
 };
 
+// Первый этап разбора: проверяет только заголовок (длину, тип, версию и
+// согласованность payloadSize с длиной датаграммы). Содержимое payload
+// проверяют parseUnitMove / parseUnitAttack.
 inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
     if (data == nullptr || size < HEADER_SIZE) {
         return ParseError::TooShort;
@@ -249,6 +268,7 @@ inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
     return Packet{header, p};
 }
 
+// Второй этап разбора: payload должен быть ровно UNIT_MOVE_PAYLOAD_SIZE байт.
 inline ParseResult<UnitMove> parseUnitMove(const Packet& packet) {
     if (packet.header.type != CommandType::UNIT_MOVE) {
         return ParseError::UnexpectedType;
@@ -268,6 +288,7 @@ inline ParseResult<UnitMove> parseUnitMove(const Packet& packet) {
     return UnitMove{*unitId, *targetX, *targetY};
 }
 
+// Второй этап разбора: payload должен быть ровно UNIT_ATTACK_PAYLOAD_SIZE байт.
 inline ParseResult<UnitAttack> parseUnitAttack(const Packet& packet) {
     if (packet.header.type != CommandType::UNIT_ATTACK) {
         return ParseError::UnexpectedType;
@@ -286,6 +307,7 @@ inline ParseResult<UnitAttack> parseUnitAttack(const Packet& packet) {
     return UnitAttack{*attackerId, *targetId};
 }
 
+// Текст ответа сервера (payload без завершающего нуля).
 inline std::string payloadText(const Packet& packet) {
     return std::string(
         reinterpret_cast<const char*>(packet.payload),
