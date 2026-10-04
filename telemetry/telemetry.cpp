@@ -36,11 +36,7 @@ double Median(std::vector<double> values) {
         return 0.0;
     }
     std::sort(values.begin(), values.end());
-    const std::size_t middle = values.size() / 2;
-    if (values.size() % 2 == 1) {
-        return values[middle];
-    }
-    return (values[middle - 1] + values[middle]) / 2.0;
+    return values[values.size() / 2];
 }
 
 double MeanJitter(const std::vector<double>& values) {
