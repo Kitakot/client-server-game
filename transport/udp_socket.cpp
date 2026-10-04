@@ -19,7 +19,7 @@ sockaddr_in toSockaddr(const Endpoint& endpoint) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = endpoint.address;
-    address.sin_port = endpoint.port;
+    address.sin_port = htons(endpoint.port);
     return address;
 }
 
@@ -38,7 +38,7 @@ std::string ToString(const Endpoint& endpoint) {
     in_addr address{};
     address.s_addr = endpoint.address;
     inet_ntop(AF_INET, &address, ip, sizeof(ip));
-    return std::string(ip) + ":" + std::to_string(ntohs(endpoint.port));
+    return std::string(ip) + ":" + std::to_string(endpoint.port);
 }
 
 UdpSocket::UdpSocket() : handle_(kInvalidHandle) {
@@ -64,7 +64,7 @@ UdpSocket::~UdpSocket() {
 #endif
 }
 
-bool UdpSocket::isOpen() const {
+bool UdpSocket::IsOpen() const {
     return handle_ != kInvalidHandle;
 }
 
@@ -78,9 +78,9 @@ bool UdpSocket::Bind(std::uint16_t port) {
 
 bool UdpSocket::SendTo(const Endpoint& to, const std::vector<std::uint8_t>& data) {
     sockaddr_in address = toSockaddr(to);
-    ssize_t sent = sendto(handle_, reinterpret_cast<const char*>(data.data()), static_cast<size_t>(data.size()), 0,
-                          reinterpret_cast<sockaddr*>(&address), sizeof(address));
-    return sent == static_cast<ssize_t>(data.size());
+    int sent = sendto(handle_, reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()), 0,
+                     reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    return sent == static_cast<int>(data.size());
 }
 
 std::optional<std::size_t> UdpSocket::ReceiveFrom(
@@ -90,7 +90,7 @@ std::optional<std::size_t> UdpSocket::ReceiveFrom(
     std::chrono::milliseconds timeout) {
     fd_set readSet;
     FD_ZERO(&readSet);
-    FD_SET(static_cast<SOCKET>(handle_), &readSet);
+    FD_SET(handle_, &readSet);
 
     timeval tv{};
     tv.tv_sec = static_cast<long>(timeout.count() / 1000);
@@ -110,8 +110,8 @@ std::optional<std::size_t> UdpSocket::ReceiveFrom(
 #endif
 
     // ошибка сокета или таймаут уже проверены выше, поэтому recvfrom не должен блокировать.
-    ssize_t received = recvfrom(handle_, reinterpret_cast<char*>(buffer), capacity, 0,
-                                reinterpret_cast<sockaddr*>(&address), &addressLength);
+    int received = recvfrom(handle_, reinterpret_cast<char*>(buffer), static_cast<int>(capacity), 0,
+                            reinterpret_cast<sockaddr*>(&address), &addressLength);
     if (received < 0) {
         return std::nullopt; // error
     }

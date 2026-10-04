@@ -15,7 +15,7 @@ using SocketHandle = int;
 
 struct Endpoint {
     std::uint32_t address; // IPv4, сетевой порядок
-    std::uint16_t port;    // сетевой порядок
+    std::uint16_t port;    // обычный порядок
 };
 
 inline bool operator==(const Endpoint& a, const Endpoint& b) {
@@ -32,7 +32,7 @@ public:
     UdpSocket(const UdpSocket&) = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
 
-    bool isOpen() const;
+    bool IsOpen() const;
     bool Bind(std::uint16_t port);
     bool SendTo(const Endpoint& to, const std::vector<std::uint8_t>& data);
 
