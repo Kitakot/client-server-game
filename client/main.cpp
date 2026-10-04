@@ -1,279 +1,139 @@
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <arpa/inet.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
-
-#include "common.hpp"
+#include "protocol/protocol.hpp"
+#include "telemetry/csv_log.hpp"
+#include "telemetry/telemetry.hpp"
+#include "transport/clock.hpp"
+#include "transport/udp_socket.hpp"
 
 #include <chrono>
 #include <iostream>
-#include <map>
 #include <string>
 
-#ifdef _WIN32
-using Socket = SOCKET;
-#else
-using Socket = int;
-#endif
+// UDP-клиент измерения задержки. Отправляет серию PING с постоянным
+// интервалом, по ответам PONG считает RTT и дописывает результаты серии в
+// docs/latency_samples.csv. Потерянные PING повторно не отправляются.
+//
+// Запуск: client <experiment_id> [count] [interval_ms]
 
-using Clock = std::chrono::steady_clock;
+constexpr std::uint16_t SERVER_PORT = 54000;
+constexpr const char* SERVER_IP = "127.0.0.1";
+constexpr std::uint64_t TIMEOUT_US = 1'000'000;
+constexpr const char* CSV_PATH = "docs/latency_samples.csv";
 
-// UDP-клиент игры. Работает по ходам длиной TURN_DURATION: в начале хода
-// отправляет команды серверу (формат — в common.hpp), а до конца хода
-// принимает ответы. Ответ сопоставляется с командой по sequence; команда без
-// ответа дольше RESPONSE_TIMEOUT считается потерянной и повторно не
-// отправляется.
-
-constexpr int SERVER_PORT = 54000;
-constexpr auto RESPONSE_TIMEOUT = std::chrono::seconds(2);
-constexpr auto TURN_DURATION = std::chrono::seconds(1);
-
-// Команда, отправленная серверу и ещё не получившая ответа.
-struct PendingCommand {
-    CommandType type;
-    Clock::time_point sentAt;
-};
-
-void closeSocket(Socket socket) {
-#ifdef _WIN32
-    closesocket(socket);
-#else
-    close(socket);
-#endif
-}
-
-// Ждёт входящую датаграмму не дольше timeout. Не блокирует отправку:
-// клиент сам решает, когда вернуться к отправке команд следующего хода.
-bool waitForData(Socket socket, std::chrono::milliseconds timeout) {
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(socket, &readSet);
-
-    timeval tv{};
-    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
-    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
-
-    int ready = select(static_cast<int>(socket) + 1, &readSet, nullptr, nullptr, &tv);
-    return ready > 0;
-}
-
-bool sameEndpoint(const sockaddr_in& a, const sockaddr_in& b) {
-    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
-}
-
-// Читает одну датаграмму и засчитывает её как ответ, только если она
-// пришла от сервера, корректно разобрана, её sequence есть среди ожидающих
-// команд и тип совпадает с типом отправленной команды.
-void receiveResponse(
-    Socket clientSocket,
-    const sockaddr_in& expectedServer,
-    std::map<uint16_t, PendingCommand>& pending) {
-    uint8_t buffer[MAX_DATAGRAM_SIZE];
-
-    sockaddr_in serverAddress{};
-#ifdef _WIN32
-    int addressLength = sizeof(serverAddress);
-#else
-    socklen_t addressLength = sizeof(serverAddress);
-#endif
-
-    int received = recvfrom(
-        clientSocket,
-        reinterpret_cast<char*>(buffer),
-        sizeof(buffer),
-        0,
-        reinterpret_cast<sockaddr*>(&serverAddress),
-        &addressLength);
-
-    if (received < 0) {
-        std::cerr << "Failed to receive server response\n";
+// Разбирает одну датаграмму и, если это корректный PONG от сервера,
+// передаёт его в телеметрию. Всё остальное отбрасывается с записью в лог.
+void handleDatagram(
+    const uint8_t* data,
+    std::size_t size,
+    const Endpoint& from,
+    const Endpoint& server,
+    std::uint64_t receivedAtUs,
+    Telemetry& telemetry) {
+    if (!(from == server)) {
+        std::cerr << "Ignored datagram from unexpected sender " << ToString(from) << "\n";
         return;
     }
 
-    if (!sameEndpoint(serverAddress, expectedServer)) {
-        std::cerr << "Ignored datagram from unexpected sender\n";
-        return;
-    }
-
-    auto parsed = parsePacket(buffer, static_cast<size_t>(received));
+    auto parsed = parsePacket(data, size);
     if (auto* error = std::get_if<ParseError>(&parsed)) {
-        std::cerr << "Dropped invalid server response"
-                  << " (size=" << received
+        std::cerr << "Dropped invalid datagram (size=" << size
                   << ", reason=" << toString(*error) << ")\n";
         return;
     }
     const Packet& packet = std::get<Packet>(parsed);
 
-    auto it = pending.find(packet.header.sequence);
-    if (it == pending.end()) {
-        std::cerr << "Unexpected response [sequence="
-                  << packet.header.sequence << "]\n";
-        return;
-    }
-    if (it->second.type != packet.header.type) {
-        std::cerr << "Response type mismatch [sequence="
-                  << packet.header.sequence << "]\n";
+    auto pong = parsePong(packet);
+    if (auto* error = std::get_if<ParseError>(&pong)) {
+        std::cerr << "Dropped non-PONG datagram [sequence=" << packet.header.sequence
+                  << ", reason=" << toString(*error) << "]\n";
         return;
     }
 
-    std::cout
-        << "Server response"
-        << " [sequence=" << packet.header.sequence << "]: "
-        << payloadText(packet)
-        << "\n";
-
-    pending.erase(it);
-}
-
-// Забывает команды, ответ на которые не пришёл за RESPONSE_TIMEOUT.
-// Повторной отправки нет: UDP не гарантирует доставку, и потерянная
-// команда просто пропадает.
-void expireTimedOut(std::map<uint16_t, PendingCommand>& pending, Clock::time_point now) {
-    for (auto it = pending.begin(); it != pending.end();) {
-        if (now - it->second.sentAt > RESPONSE_TIMEOUT) {
-            std::cerr << "No response [sequence=" << it->first << "]\n";
-            it = pending.erase(it);
-        } else {
-            ++it;
-        }
+    // RTT считается только по часам клиента; серверные метки из PONG —
+    // диагностика.
+    PongResult result = telemetry.OnPong(packet.header.sequence, receivedAtUs);
+    if (result != PongResult::Received) {
+        std::cerr << toString(result) << " [sequence=" << packet.header.sequence << "]\n";
     }
 }
 
-bool sendPacket(
-    Socket clientSocket,
-    const sockaddr_in& serverAddress,
-    const std::vector<uint8_t>& packet) {
-    int sent = sendto(
-        clientSocket,
-        reinterpret_cast<const char*>(packet.data()),
-        static_cast<int>(packet.size()),
-        0,
-        reinterpret_cast<const sockaddr*>(&serverAddress),
-        sizeof(serverAddress));
-
-    if (sent < 0) {
-        std::cerr << "Failed to send command\n";
-        return false;
-    }
-    return true;
-}
-
-int main() {
-#ifdef _WIN32
-    WSADATA data{};
-
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-        std::cerr << "Failed to initialize Winsock\n";
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: client <experiment_id> [count] [interval_ms]\n";
         return 1;
     }
-#endif
+    const std::string experimentId = argv[1];
+    const int count = argc > 2 ? std::stoi(argv[2]) : 50;
+    const int intervalMs = argc > 3 ? std::stoi(argv[3]) : 200;
 
-    Socket clientSocket = socket(AF_INET, SOCK_DGRAM, 0);
-
-#ifdef _WIN32
-    if (clientSocket == INVALID_SOCKET) {
-#else
-    if (clientSocket < 0) {
-#endif
+    UdpSocket socket;
+    if (!socket.IsOpen()) {
         std::cerr << "Failed to create UDP socket\n";
-
-#ifdef _WIN32
-        WSACleanup();
-#endif
-
         return 1;
     }
-
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(SERVER_PORT);
-
-    serverAddress.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (serverAddress.sin_addr.s_addr == INADDR_NONE) {
+    auto server = MakeEndpoint(SERVER_IP, SERVER_PORT);
+    if (!server) {
         std::cerr << "Invalid server address\n";
-        closeSocket(clientSocket);
         return 1;
     }
 
-    std::cout << "Strategy game client started\n";
-    std::cout << "Connected to UDP server on port "
-              << SERVER_PORT << "\n";
+    std::cout << "Series " << experimentId << ": " << count
+              << " PING every " << intervalMs << " ms to " << ToString(*server) << "\n";
 
-    // sequence растёт с каждым отправленным пакетом (после 65535 начнётся
-    // с 0). pending — команды, ждущие ответа, по их sequence.
+    Telemetry telemetry(experimentId, TIMEOUT_US);
+    uint8_t buffer[MAX_DATAGRAM_SIZE];
+
+    // Принимает ответы до момента untilUs и отмечает просроченные измерения.
+    auto receiveUntil = [&](std::uint64_t untilUs) {
+        while (true) {
+            const std::uint64_t nowUs = NowUs();
+            if (nowUs >= untilUs) {
+                break;
+            }
+            const auto wait = std::chrono::milliseconds((untilUs - nowUs + 999) / 1000);
+
+            Endpoint from;
+            auto size = socket.ReceiveFrom(buffer, sizeof(buffer), from, wait);
+            const std::uint64_t receivedAtUs = NowUs();
+            if (size) {
+                handleDatagram(buffer, *size, from, *server, receivedAtUs, telemetry);
+            }
+            telemetry.Expire(NowUs());
+        }
+    };
+
+    const std::uint64_t startUs = NowUs();
+    const std::uint64_t intervalUs = static_cast<std::uint64_t>(intervalMs) * 1000;
     uint16_t sequence = 1;
-    int currentTurn = 1;
-    std::map<uint16_t, PendingCommand> pending;
 
-    constexpr int playerUnitId = 1;
-    constexpr int enemyUnitId = 42;
+    for (int i = 0; i < count; ++i) {
+        // Момент отправки считается от начала серии, чтобы интервал не
+        // накапливал погрешность.
+        receiveUntil(startUs + i * intervalUs);
 
-    while (true) {
-        const auto turnStart = Clock::now();
-        std::cout << "\n--- Turn " << currentTurn << " ---\n";
-
-        // Каждый ход юнит перемещается, каждый третий ход ещё и атакует.
-        UnitMove moveCommand{
-            playerUnitId,
-            currentTurn * 2,
-            currentTurn
-        };
-
-        std::cout
-            << "Moving unit "
-            << moveCommand.unitId
-            << " to ("
-            << moveCommand.targetX
-            << ", "
-            << moveCommand.targetY
-            << ")\n";
-
-        if (sendPacket(clientSocket, serverAddress, serializeUnitMove(sequence, moveCommand))) {
-            pending[sequence] = {CommandType::UNIT_MOVE, Clock::now()};
+        const std::uint64_t sentUs = NowUs();
+        if (socket.SendTo(*server, serializePing(sequence, Ping{sentUs}))) {
+            telemetry.OnPingSent(sequence, sentUs);
+        } else {
+            std::cerr << "Failed to send PING [sequence=" << sequence << "]\n";
         }
         ++sequence;
-
-        if (currentTurn % 3 == 0) {
-            UnitAttack attackCommand{
-                playerUnitId,
-                enemyUnitId
-            };
-
-            std::cout
-                << "Unit "
-                << attackCommand.attackerId
-                << " attacks unit "
-                << attackCommand.targetId
-                << "\n";
-
-            if (sendPacket(clientSocket, serverAddress, serializeUnitAttack(sequence, attackCommand))) {
-                pending[sequence] = {CommandType::UNIT_ATTACK, Clock::now()};
-            }
-            ++sequence;
-        }
-
-        // До начала следующего хода принимаем ответы по мере их прихода.
-        const auto turnEnd = turnStart + TURN_DURATION;
-        for (auto now = Clock::now(); now < turnEnd; now = Clock::now()) {
-            auto remaining = std::chrono::ceil<std::chrono::milliseconds>(turnEnd - now);
-            if (waitForData(clientSocket, remaining)) {
-                receiveResponse(clientSocket, serverAddress, pending);
-            }
-            expireTimedOut(pending, Clock::now());
-        }
-
-        ++currentTurn;
     }
 
-    closeSocket(clientSocket);
+    // Ждём ответы на последние PING: тайм-аут и небольшой запас.
+    receiveUntil(NowUs() + TIMEOUT_US + 200'000);
+    telemetry.Expire(NowUs());
 
-#ifdef _WIN32
-    WSACleanup();
-#endif
+    if (!AppendCsvFile(CSV_PATH, telemetry.Samples())) {
+        std::cerr << "Failed to write " << CSV_PATH << "\n";
+    }
 
+    const Summary s = telemetry.Summarize();
+    std::cout << "sent=" << s.sent << " received=" << s.received
+              << " timeout=" << s.timeouts << " late=" << s.late
+              << " duplicate=" << s.duplicate << " unknown=" << s.unknown << "\n"
+              << "rtt min/mean/median/max = " << s.minMs << " / " << s.meanMs
+              << " / " << s.medianMs << " / " << s.maxMs << " ms\n"
+              << "srtt=" << s.srttMs << " ms  jitter=" << s.jitterMs
+              << " ms  loss=" << s.lossPercent << " %\n";
     return 0;
 }

@@ -1,65 +1,27 @@
-#include "common.hpp"
+#include "protocol/protocol.hpp"
+#include "transport/clock.hpp"
+#include "transport/udp_socket.hpp"
 
-#include <iostream>
+#include <chrono>
 #include <fstream>
+#include <iostream>
 #include <string>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-using Socket = SOCKET;
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using Socket = int;
-#endif
+// UDP-сервер игры. Принимает команды клиентов (формат — в protocol.hpp),
+// проверяет их и отвечает тому, кто прислал: на UNIT_MOVE / UNIT_ATTACK —
+// текстовым подтверждением, на PING — пакетом PONG. Состояния игры и списка
+// клиентов сервер не хранит: каждая датаграмма обрабатывается независимо.
 
-// UDP-сервер игры. Принимает команды клиентов (формат — в common.hpp),
-// проверяет их и отвечает текстовым подтверждением тому, кто прислал
-// команду. Состояния игры и списка клиентов сервер пока не хранит: каждая
-// датаграмма обрабатывается независимо.
-
-constexpr int PORT = 54000;
-
-void closeSocket(Socket socket) {
-#ifdef _WIN32
-    closesocket(socket);
-#else
-    close(socket);
-#endif
-}
-
-std::string endpointToString(const sockaddr_in& address) {
-    char ip[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &address.sin_addr, ip, sizeof(ip));
-    return std::string(ip) + ":" + std::to_string(ntohs(address.sin_port));
-}
+constexpr std::uint16_t PORT = 54000;
 
 int main() {
-#ifdef _WIN32
-    WSADATA data;
-    WSAStartup(MAKEWORD(2, 2), &data);
-#endif
-
-    Socket serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (serverSocket < 0) {
+    UdpSocket socket;
+    if (!socket.IsOpen()) {
         std::cerr << "Failed to create socket\n";
         return 1;
     }
-
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
-    serverAddress.sin_port = htons(PORT);
-
-    if (bind(
-            serverSocket,
-            reinterpret_cast<sockaddr*>(&serverAddress),
-            sizeof(serverAddress)) < 0) {
+    if (!socket.Bind(PORT)) {
         std::cerr << "Failed to bind socket\n";
-        closeSocket(serverSocket);
         return 1;
     }
 
@@ -69,14 +31,14 @@ int main() {
 
     // Некорректная датаграмма только журналируется; ответ на неё не
     // отправляется.
-    auto dropDatagram = [&log](const sockaddr_in& from, int size, ParseError error) {
-        std::cerr << "[DROP] from=" << endpointToString(from)
+    auto dropDatagram = [&log](const Endpoint& from, std::size_t size, ParseError error) {
+        std::cerr << "[DROP] from=" << ToString(from)
                   << " size=" << size
                   << " reason=" << toString(error) << "\n";
         if (log) {
-            log << "dropped from=" << endpointToString(from)
+            log << "dropped from=" << ToString(from)
                 << " size=" << size
-                << " reason=\"" << toString(error) << "\"\n";
+                << " reason=\"" << toString(error) << "\"" << std::endl;
         }
     };
 
@@ -84,42 +46,51 @@ int main() {
         uint8_t buffer[MAX_DATAGRAM_SIZE];
 
         // Адрес отправителя: на него уйдёт ответ.
-        sockaddr_in clientAddress{};
-#ifdef _WIN32
-        int addressLength = sizeof(clientAddress);
-#else
-        socklen_t addressLength = sizeof(clientAddress);
-#endif
-
-        int received = recvfrom(
-            serverSocket,
-            reinterpret_cast<char*>(buffer),
-            sizeof(buffer),
-            0,
-            reinterpret_cast<sockaddr*>(&clientAddress),
-            &addressLength);
-
-        // Ошибка сокета (например, ICMP port unreachable на Windows или
-        // датаграмма больше буфера) — пропускаем, сервер продолжает работу.
-        if (received < 0) {
+        Endpoint client;
+        auto received = socket.ReceiveFrom(
+            buffer, sizeof(buffer), client, std::chrono::milliseconds(1000));
+        if (!received) {
             continue;
         }
+        // Метка снимается сразу после приёма, до разбора пакета.
+        const uint64_t receivedAtUs = NowUs();
 
         // Сначала проверяется заголовок, затем в ветке по типу — payload.
-        auto parsed = parsePacket(buffer, static_cast<size_t>(received));
+        auto parsed = parsePacket(buffer, *received);
         if (auto* error = std::get_if<ParseError>(&parsed)) {
-            dropDatagram(clientAddress, received, *error);
+            dropDatagram(client, *received, *error);
             continue;
         }
         const Packet& packet = std::get<Packet>(parsed);
         const uint16_t sequence = packet.header.sequence;
+
+        if (packet.header.type == CommandType::PING) {
+            auto ping = parsePing(packet);
+            if (auto* error = std::get_if<ParseError>(&ping)) {
+                dropDatagram(client, *received, *error);
+                continue;
+            }
+
+            Pong pong{};
+            pong.clientSendTimeUs = std::get<Ping>(ping).clientSendTimeUs;
+            pong.serverReceiveTimeUs = receivedAtUs;
+            pong.serverSendTimeUs = NowUs();
+            socket.SendTo(client, serializePong(sequence, pong));
+
+            if (log) {
+                log << "sequence=" << sequence
+                    << " type=PING processingUs="
+                    << pong.serverSendTimeUs - pong.serverReceiveTimeUs << "\n";
+            }
+            continue;
+        }
 
         std::string response;
 
         if (packet.header.type == CommandType::UNIT_MOVE) {
             auto command = parseUnitMove(packet);
             if (auto* error = std::get_if<ParseError>(&command)) {
-                dropDatagram(clientAddress, received, *error);
+                dropDatagram(client, *received, *error);
                 continue;
             }
             const UnitMove& move = std::get<UnitMove>(command);
@@ -137,7 +108,7 @@ int main() {
         else if (packet.header.type == CommandType::UNIT_ATTACK) {
             auto command = parseUnitAttack(packet);
             if (auto* error = std::get_if<ParseError>(&command)) {
-                dropDatagram(clientAddress, received, *error);
+                dropDatagram(client, *received, *error);
                 continue;
             }
             const UnitAttack& attack = std::get<UnitAttack>(command);
@@ -150,6 +121,11 @@ int main() {
                       << " attacker=" << attack.attackerId
                       << " target=" << attack.targetId << "\n";
         }
+        else {
+            // PONG сервер не принимает: это ответ, а не запрос.
+            dropDatagram(client, *received, ParseError::UnexpectedType);
+            continue;
+        }
 
         if (log) {
             log << "sequence=" << sequence
@@ -160,22 +136,6 @@ int main() {
 
         // Ответ повторяет тип и sequence запроса, чтобы клиент мог найти
         // команду, на которую он пришёл.
-        auto responsePacket = serializeTextResponse(packet.header.type, sequence, response);
-
-        sendto(
-            serverSocket,
-            reinterpret_cast<const char*>(responsePacket.data()),
-            static_cast<int>(responsePacket.size()),
-            0,
-            reinterpret_cast<sockaddr*>(&clientAddress),
-            addressLength);
+        socket.SendTo(client, serializeTextResponse(packet.header.type, sequence, response));
     }
-
-    closeSocket(serverSocket);
-
-#ifdef _WIN32
-    WSACleanup();
-#endif
-
-    return 0;
 }
