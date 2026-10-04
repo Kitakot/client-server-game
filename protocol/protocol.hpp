@@ -26,6 +26,8 @@
 // Payload запросов:
 //   UNIT_MOVE   (12 байт): i32 unitId, i32 targetX, i32 targetY
 //   UNIT_ATTACK  (8 байт): i32 attackerId, i32 targetId
+//   PING         (8 байт): u64 clientSendTimeUs
+//   PONG        (24 байт): u64 clientSendTimeUs, u64 serverReceiveTimeUs, u64 serverSendTimeUs
 // Payload ответа сервера — ASCII-текст без завершающего нуля.
 //
 // Пример: UNIT_MOVE, sequence=1, юнит 1 в точку (2, 1) — 19 байт:
@@ -41,13 +43,17 @@ constexpr size_t MAX_DATAGRAM_SIZE = 1024;
 
 enum class CommandType : uint8_t {
     UNIT_MOVE = 1,
-    UNIT_ATTACK = 2
+    UNIT_ATTACK = 2,
+    PING = 3,
+    PONG = 4
 };
 
 inline bool isKnownCommandType(uint8_t value) {
     switch (static_cast<CommandType>(value)) {
         case CommandType::UNIT_MOVE:
         case CommandType::UNIT_ATTACK:
+        case CommandType::PING:
+        case CommandType::PONG:
             return true;
     }
     return false;
@@ -72,6 +78,18 @@ struct UnitAttack {
     int32_t targetId;
 };
 constexpr uint16_t UNIT_ATTACK_PAYLOAD_SIZE = 8;
+
+struct Ping {
+    uint64_t clientSendTimeUs;
+};
+constexpr uint16_t PING_PAYLOAD_SIZE = 8;
+
+struct Pong {
+    uint64_t clientSendTimeUs;
+    uint64_t serverReceiveTimeUs;
+    uint64_t serverSendTimeUs;
+};
+constexpr uint16_t PONG_PAYLOAD_SIZE = 24;
 
 enum class ParseError {
     TooShort,         // датаграмма короче заголовка
@@ -213,6 +231,22 @@ inline std::vector<uint8_t> serializeUnitAttack(uint16_t sequence, const UnitAtt
     return serializePacket(CommandType::UNIT_ATTACK, sequence, payload);
 }
 
+inline std::vector<uint8_t> serializePing(uint16_t sequence, const Ping& ping) {
+    std::vector<uint8_t> payload;
+    payload.reserve(PING_PAYLOAD_SIZE);
+    WriteU64(payload, ping.clientSendTimeUs);
+    return serializePacket(CommandType::PING, sequence, payload);
+}
+
+inline std::vector<uint8_t> serializePong(uint16_t sequence, const Pong& pong) {
+    std::vector<uint8_t> payload;
+    payload.reserve(PONG_PAYLOAD_SIZE);
+    WriteU64(payload, pong.clientSendTimeUs);
+    WriteU64(payload, pong.serverReceiveTimeUs);
+    WriteU64(payload, pong.serverSendTimeUs);
+    return serializePacket(CommandType::PONG, sequence, payload);
+}
+
 // Ответ сервера на команду: тот же тип и номер, полезная нагрузка — текст.
 inline std::vector<uint8_t> serializeTextResponse(
     CommandType type,
@@ -305,6 +339,44 @@ inline ParseResult<UnitAttack> parseUnitAttack(const Packet& packet) {
         return ParseError::BadPayloadSize;
     }
     return UnitAttack{*attackerId, *targetId};
+}
+
+// Второй этап разбора: payload должен быть ровно PING_PAYLOAD_SIZE байт.
+inline ParseResult<Ping> parsePing(const Packet& packet) {
+    if (packet.header.type != CommandType::PING) {
+        return ParseError::UnexpectedType;
+    }
+    if (packet.header.payloadSize != PING_PAYLOAD_SIZE) {
+        return ParseError::BadPayloadSize;
+    }
+
+    const uint8_t* p = packet.payload;
+    const uint8_t* end = packet.payload + packet.header.payloadSize;
+    auto clientSendTimeUs = ReadU64(p, end);
+    if (!clientSendTimeUs || p != end) {
+        return ParseError::BadPayloadSize;
+    }
+    return Ping{*clientSendTimeUs};
+}
+
+// Второй этап разбора: payload должен быть ровно PONG_PAYLOAD_SIZE байт.
+inline ParseResult<Pong> parsePong(const Packet& packet) {
+    if (packet.header.type != CommandType::PONG) {
+        return ParseError::UnexpectedType;
+    }
+    if (packet.header.payloadSize != PONG_PAYLOAD_SIZE) {
+        return ParseError::BadPayloadSize;
+    }
+
+    const uint8_t* p = packet.payload;
+    const uint8_t* end = packet.payload + packet.header.payloadSize;
+    auto clientSendTimeUs = ReadU64(p, end);
+    auto serverReceiveTimeUs = ReadU64(p, end);
+    auto serverSendTimeUs = ReadU64(p, end);
+    if (!clientSendTimeUs || !serverReceiveTimeUs || !serverSendTimeUs || p != end) {
+        return ParseError::BadPayloadSize;
+    }
+    return Pong{*clientSendTimeUs, *serverReceiveTimeUs, *serverSendTimeUs};
 }
 
 // Текст ответа сервера (payload без завершающего нуля).
