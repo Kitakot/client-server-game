@@ -42,15 +42,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
-#add_executable(tests
-#    tests/protocol_tests.cpp
-#    tests/telemetry_tests.cpp
-#    tests/test_reliable_channel.cpp
-#    tests/test_adaptive_timeout.cpp
-#    tests/test_dedup_window.cpp
-#    tests/test_delivery_log.cpp
-#    tests/test_order_book.cpp)
-#target_link_libraries(tests PRIVATE protocol telemetry reliability Catch2::Catch2WithMain)
+add_executable(tests
+    tests/protocol_tests.cpp
+    tests/telemetry_tests.cpp
+    tests/test_reliable_channel.cpp
+    tests/test_adaptive_timeout.cpp
+    tests/test_dedup_window.cpp
+    tests/test_delivery_log.cpp
+    tests/test_order_book.cpp)
+target_link_libraries(tests PRIVATE protocol telemetry reliability Catch2::Catch2WithMain)
 
-#enable_testing()
-#add_test(NAME tests COMMAND tests)
+enable_testing()
+# Каждый TEST_CASE регистрируется в ctest как отдельный тест.
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+include(Catch)
+catch_discover_tests(tests)
