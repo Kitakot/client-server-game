@@ -16,3 +16,6 @@ Testing/
 _deps/
 CPackConfig.cmake
 CPackSourceConfig.cmake
+
+# Server log files
+server.log
