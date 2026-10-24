@@ -25,7 +25,8 @@ TEST_CASE("PING is written in network byte order") {
         0x03,                    // packetType = PING
         0x01, 0x02,              // sequenceNumber
         0x00, 0x08,              // payloadSize
-        0x00, 0x01,              // protocolVersion
+        0x00, 0x02,              // protocolVersion
+        0x00,                    // requiresAck
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
     REQUIRE(bytes == expected);
 }
@@ -77,7 +78,7 @@ TEST_CASE("Unknown packet type is rejected") {
 
 TEST_CASE("Wrong protocol version is rejected") {
     auto bytes = serializePing(17, Ping{100});
-    bytes[6] = 0x02;
+    bytes[6] = 0x03;
     REQUIRE(failsWith(parsePingBytes(bytes), ParseError::BadVersion));
 }
 
@@ -90,4 +91,69 @@ TEST_CASE("PING with wrong payload size is rejected") {
     // Заголовок согласован с длиной датаграммы, но payload не 8 байт.
     auto bytes = serializePacket(CommandType::PING, 17, {0x01, 0x02, 0x03, 0x04});
     REQUIRE(failsWith(parsePingBytes(bytes), ParseError::BadPayloadSize));
+}
+
+namespace {
+
+ParseResult<Ack> parseAckBytes(const std::vector<uint8_t>& bytes) {
+    auto packet = parsePacket(bytes.data(), bytes.size());
+    if (auto* error = std::get_if<ParseError>(&packet)) {
+        return *error;
+    }
+    return parseAck(std::get<Packet>(packet));
+}
+
+bool ackFailsWith(const ParseResult<Ack>& result, ParseError expected) {
+    auto* error = std::get_if<ParseError>(&result);
+    return error != nullptr && *error == expected;
+}
+
+}  // namespace
+
+TEST_CASE("ACK is written in network byte order") {
+    auto bytes = serializeAck(0x0102);
+    const std::vector<uint8_t> expected = {
+        0x05,         // packetType = ACK
+        0x01, 0x02,   // sequenceNumber = подтверждаемый номер
+        0x00, 0x02,   // payloadSize
+        0x00, 0x02,   // protocolVersion
+        0x00,         // requiresAck: ACK не подтверждается
+        0x01, 0x02};  // acknowledgedSequence
+    REQUIRE(bytes == expected);
+}
+
+TEST_CASE("ACK round trip") {
+    auto ack = parseAckBytes(serializeAck(65535));
+    REQUIRE(std::holds_alternative<Ack>(ack));
+    REQUIRE(std::get<Ack>(ack).acknowledgedSequence == 65535);
+}
+
+TEST_CASE("Unit orders require ACK, PING does not") {
+    auto attack = serializeUnitAttack(3, UnitAttack{1, 2});
+    auto packet = parsePacket(attack.data(), attack.size());
+    REQUIRE(std::holds_alternative<Packet>(packet));
+    REQUIRE(std::get<Packet>(packet).header.requiresAck);
+
+    auto move = serializeUnitMove(4, UnitMove{1, 2, 3});
+    REQUIRE(move[7] == 0x01);
+
+    auto ping = serializePing(5, Ping{1});
+    REQUIRE(ping[7] == 0x00);
+}
+
+TEST_CASE("ACK that requires ACK is rejected") {
+    auto bytes = serializeAck(7);
+    bytes[7] = 0x01;
+    REQUIRE(ackFailsWith(parseAckBytes(bytes), ParseError::BadAckFlag));
+}
+
+TEST_CASE("requiresAck other than 0 or 1 is rejected") {
+    auto bytes = serializePing(7, Ping{1});
+    bytes[7] = 0x02;
+    REQUIRE(failsWith(parsePingBytes(bytes), ParseError::BadAckFlag));
+}
+
+TEST_CASE("ACK with wrong payload size is rejected") {
+    auto bytes = serializePacket(CommandType::ACK, 7, {0x00, 0x07, 0x00});
+    REQUIRE(ackFailsWith(parseAckBytes(bytes), ParseError::BadPayloadSize));
 }
