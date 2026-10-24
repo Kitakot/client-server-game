@@ -313,7 +313,7 @@ inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
     auto payloadSize = ReadU16(p, end);
     auto version = ReadU16(p, end);
     auto ackFlag = ReadU8(p, end);
-    if (!type || !sequence || !payloadSize || !version) {
+    if (!type || !sequence || !payloadSize || !version || !ackFlag) {
         return ParseError::TooShort;
     }
 
@@ -331,7 +331,8 @@ inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
         return ParseError::LengthMismatch;
     }
 
-    PacketHeader header{static_cast<CommandType>(*type), *sequence, *payloadSize, *version};
+    PacketHeader header{
+        static_cast<CommandType>(*type), *sequence, *payloadSize, *version, *ackFlag == 1};
     return Packet{header, p};
 }
 
