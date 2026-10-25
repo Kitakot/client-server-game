@@ -1,18 +1,31 @@
 #include "protocol/protocol.hpp"
+#include "reliability/dedup_window.hpp"
 #include "transport/clock.hpp"
 #include "transport/udp_socket.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 
 // UDP-сервер игры. Принимает команды клиентов (формат — в protocol.hpp),
 // проверяет их и отвечает тому, кто прислал: на UNIT_MOVE / UNIT_ATTACK —
-// текстовым подтверждением, на PING — пакетом PONG. Состояния игры и списка
-// клиентов сервер не хранит: каждая датаграмма обрабатывается независимо.
+// ACK (если requiresAck = 1) и текстовым результатом, на PING — пакетом PONG.
+// Для каждого клиента сервер хранит окно обработанных sequenceNumber, чтобы
+// повторно присланный приказ не применялся дважды, и здоровье юнитов, чтобы
+// повторное применение атаки было видно в журнале.
 
 constexpr std::uint16_t PORT = 54000;
+constexpr int UNIT_START_HP = 1000;
+constexpr int ATTACK_DAMAGE = 1;
+
+// Соединения нет, поэтому клиент определяется адресом и портом отправителя.
+std::uint64_t ClientKey(const Endpoint& endpoint) {
+    return (static_cast<std::uint64_t>(endpoint.address) << 16) | endpoint.port;
+}
 
 int main() {
     UdpSocket socket;
@@ -28,6 +41,9 @@ int main() {
     std::ofstream log("server.log", std::ios::app);
 
     std::cout << "UDP server started on port " << PORT << "\n";
+
+    std::unordered_map<std::uint64_t, DedupWindow> processed;  // клиент -> окно номеров
+    std::unordered_map<std::int32_t, int> unitHp;
 
     // Некорректная датаграмма только журналируется; ответ на неё не
     // отправляется.
@@ -85,12 +101,36 @@ int main() {
             continue;
         }
 
+        // Надёжный приказ: ACK уходит сразу после проверки payload, до
+        // применения. На дубликат ACK тоже отправляется: раз клиент повторил
+        // пакет, прошлый ACK потерялся, и без нового клиент будет слать пакет
+        // до исчерпания попыток. Сам эффект дубликата не применяется.
+        auto acceptReliable = [&]() {
+            if (!packet.header.requiresAck) {
+                return true;
+            }
+            socket.SendTo(client, serializeAck(sequence));
+            if (processed[ClientKey(client)].MarkProcessed(sequence)) {
+                return true;
+            }
+            std::cout << "[DUPLICATE] seq=" << sequence
+                      << " from=" << ToString(client) << " ack resent, effect skipped\n";
+            if (log) {
+                log << "duplicate sequence=" << sequence
+                    << " from=" << ToString(client) << "\n";
+            }
+            return false;
+        };
+
         std::string response;
 
         if (packet.header.type == CommandType::UNIT_MOVE) {
             auto command = parseUnitMove(packet);
             if (auto* error = std::get_if<ParseError>(&command)) {
                 dropDatagram(client, *received, *error);
+                continue;
+            }
+            if (!acceptReliable()) {
                 continue;
             }
             const UnitMove& move = std::get<UnitMove>(command);
@@ -111,18 +151,26 @@ int main() {
                 dropDatagram(client, *received, *error);
                 continue;
             }
+            if (!acceptReliable()) {
+                continue;
+            }
             const UnitAttack& attack = std::get<UnitAttack>(command);
+
+            int& hp = unitHp.try_emplace(attack.targetId, UNIT_START_HP).first->second;
+            hp = (std::max)(0, hp - ATTACK_DAMAGE);
 
             response =
                 "UNIT_ATTACK attacker=" + std::to_string(attack.attackerId) +
-                " target=" + std::to_string(attack.targetId);
+                " target=" + std::to_string(attack.targetId) +
+                " hp=" + std::to_string(hp);
 
             std::cout << "[UNIT_ATTACK] seq=" << sequence
                       << " attacker=" << attack.attackerId
-                      << " target=" << attack.targetId << "\n";
+                      << " target=" << attack.targetId
+                      << " hp=" << hp << "\n";
         }
         else {
-            // PONG сервер не принимает: это ответ, а не запрос.
+            // PONG и ACK сервер не принимает: это ответы, а не запросы.
             dropDatagram(client, *received, ParseError::UnexpectedType);
             continue;
         }
@@ -134,8 +182,8 @@ int main() {
                 << " response=\"" << response << "\"\n";
         }
 
-        // Ответ повторяет тип и sequence запроса, чтобы клиент мог найти
-        // команду, на которую он пришёл.
+        // Ответ повторяет тип и sequence запроса. Он ненадёжен: доставку
+        // приказа подтверждает ACK, а это игровой результат.
         socket.SendTo(client, serializeTextResponse(packet.header.type, sequence, response));
     }
 }

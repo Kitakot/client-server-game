@@ -16,11 +16,13 @@
 // отбрасывает, без ответа.
 //
 // Формат датаграммы (все многобайтовые поля в сетевом порядке, big-endian):
-//   0  u8  packetType       CommandType: 1 = UNIT_MOVE, 2 = UNIT_ATTACK
-//   1  u16 sequenceNumber   номер пакета у клиента; в ответе — номер запроса
+//   0  u8  packetType       CommandType: 1 = UNIT_MOVE, 2 = UNIT_ATTACK,
+//                           3 = PING, 4 = PONG, 5 = ACK
+//   1  u16 sequenceNumber   номер пакета у клиента; в ответе и ACK — номер запроса
 //   3  u16 payloadSize      длина payload в байтах
 //   5  u16 protocolVersion  PROTOCOL_VERSION
-//   7  payload[payloadSize]
+//   7  u8  requiresAck      1 — получатель обязан ответить ACK, 0 — нет
+//   8  payload[payloadSize]
 // Вся датаграмма не длиннее MAX_DATAGRAM_SIZE.
 //
 // Payload запросов:
@@ -30,22 +32,26 @@
 //   PONG        (24 байт): u64 clientSendTimeUs, u64 serverReceiveTimeUs, u64 serverSendTimeUs
 // Payload ответа сервера — ASCII-текст без завершающего нуля.
 //
-// Пример: UNIT_MOVE, sequence=1, юнит 1 в точку (2, 1) — 19 байт:
-//   01 | 00 01 | 00 0C | 00 01 | 00 00 00 01 | 00 00 00 02 | 00 00 00 01
+// Надёжные пакеты (requiresAck = 1): UNIT_MOVE, UNIT_ATTACK. Сам ACK
+// подтверждения не требует: пакет ACK с requiresAck = 1 отклоняется.
+//
+// Пример: UNIT_MOVE, sequence=1, юнит 1 в точку (2, 1) — 20 байт:
+//   01 | 00 01 | 00 0C | 00 02 | 01 | 00 00 00 01 | 00 00 00 02 | 00 00 00 01
 //
 // Структуры никогда не копируются в буфер целиком: каждое поле пишется и
 // читается явно, поэтому формат не зависит от выравнивания и порядка байтов
 // платформы.
 
-constexpr uint16_t PROTOCOL_VERSION = 1;
-constexpr size_t HEADER_SIZE = 7;
+constexpr uint16_t PROTOCOL_VERSION = 2;
+constexpr size_t HEADER_SIZE = 8;
 constexpr size_t MAX_DATAGRAM_SIZE = 1024;
 
 enum class CommandType : uint8_t {
     UNIT_MOVE = 1,
     UNIT_ATTACK = 2,
     PING = 3,
-    PONG = 4
+    PONG = 4,
+    ACK = 5
 };
 
 inline bool isKnownCommandType(uint8_t value) {
@@ -54,6 +60,7 @@ inline bool isKnownCommandType(uint8_t value) {
         case CommandType::UNIT_ATTACK:
         case CommandType::PING:
         case CommandType::PONG:
+        case CommandType::ACK:
             return true;
     }
     return false;
@@ -64,6 +71,7 @@ struct PacketHeader {
     uint16_t sequence;
     uint16_t payloadSize;
     uint16_t protocolVersion;
+    bool requiresAck;
 };
 
 struct UnitMove {
@@ -91,13 +99,19 @@ struct Pong {
 };
 constexpr uint16_t PONG_PAYLOAD_SIZE = 24;
 
+struct Ack {
+    uint16_t acknowledgedSequence;
+};
+constexpr uint16_t ACK_PAYLOAD_SIZE = 2;
+
 enum class ParseError {
     TooShort,         // датаграмма короче заголовка
     UnknownType,      // packetType не из CommandType
     BadVersion,       // protocolVersion != PROTOCOL_VERSION
     LengthMismatch,   // HEADER_SIZE + payloadSize != длина датаграммы
     UnexpectedType,   // тип пакета не тот, что ожидает парсер
-    BadPayloadSize    // payloadSize не совпадает с размером команды
+    BadPayloadSize,   // payloadSize не совпадает с размером команды
+    BadAckFlag        // requiresAck не 0/1
 };
 
 inline const char* toString(ParseError error) {
@@ -108,6 +122,7 @@ inline const char* toString(ParseError error) {
         case ParseError::LengthMismatch: return "payload size does not match datagram length";
         case ParseError::UnexpectedType: return "unexpected packet type";
         case ParseError::BadPayloadSize: return "invalid payload size for packet type";
+        case ParseError::BadAckFlag: return "invalid requiresAck flag";
     }
     return "unknown error";
 }
@@ -196,7 +211,8 @@ inline std::optional<int32_t> ReadI32(const uint8_t*& p, const uint8_t* end) {
 inline std::vector<uint8_t> serializePacket(
     CommandType type,
     uint16_t sequence,
-    const std::vector<uint8_t>& payload
+    const std::vector<uint8_t>& payload,
+    bool requiresAck = false
 ) {
     // Скобки вокруг max защищают от макроса max из <windows.h>.
     if (payload.size() > (std::numeric_limits<uint16_t>::max)() ||
@@ -210,17 +226,20 @@ inline std::vector<uint8_t> serializePacket(
     WriteU16(packet, sequence);
     WriteU16(packet, static_cast<uint16_t>(payload.size()));
     WriteU16(packet, PROTOCOL_VERSION);
+    WriteU8(packet, requiresAck ? 1 : 0);
     packet.insert(packet.end(), payload.begin(), payload.end());
     return packet;
 }
 
+// Приказы юнитам надёжны: в пошаговой игре каждый приказ отдаётся один раз,
+// и потерянный пакет означает, что юнит пропустит ход.
 inline std::vector<uint8_t> serializeUnitMove(uint16_t sequence, const UnitMove& command) {
     std::vector<uint8_t> payload;
     payload.reserve(UNIT_MOVE_PAYLOAD_SIZE);
     WriteI32(payload, command.unitId);
     WriteI32(payload, command.targetX);
     WriteI32(payload, command.targetY);
-    return serializePacket(CommandType::UNIT_MOVE, sequence, payload);
+    return serializePacket(CommandType::UNIT_MOVE, sequence, payload, /* requiresAck */ true);
 }
 
 inline std::vector<uint8_t> serializeUnitAttack(uint16_t sequence, const UnitAttack& command) {
@@ -228,7 +247,7 @@ inline std::vector<uint8_t> serializeUnitAttack(uint16_t sequence, const UnitAtt
     payload.reserve(UNIT_ATTACK_PAYLOAD_SIZE);
     WriteI32(payload, command.attackerId);
     WriteI32(payload, command.targetId);
-    return serializePacket(CommandType::UNIT_ATTACK, sequence, payload);
+    return serializePacket(CommandType::UNIT_ATTACK, sequence, payload, /* requiresAck */ true);
 }
 
 inline std::vector<uint8_t> serializePing(uint16_t sequence, const Ping& ping) {
@@ -245,6 +264,15 @@ inline std::vector<uint8_t> serializePong(uint16_t sequence, const Pong& pong) {
     WriteU64(payload, pong.serverReceiveTimeUs);
     WriteU64(payload, pong.serverSendTimeUs);
     return serializePacket(CommandType::PONG, sequence, payload);
+}
+
+// ACK несёт тот же sequenceNumber, что и подтверждаемый пакет, и сам
+// подтверждения не требует: иначе получилась бы бесконечная цепочка ACK на ACK
+inline std::vector<uint8_t> serializeAck(uint16_t acknowledgedSequence) {
+    std::vector<uint8_t> payload;
+    payload.reserve(ACK_PAYLOAD_SIZE);
+    WriteU16(payload, acknowledgedSequence);
+    return serializePacket(CommandType::ACK, acknowledgedSequence, payload);
 }
 
 // Ответ сервера на команду: тот же тип и номер, полезная нагрузка — текст.
@@ -284,7 +312,8 @@ inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
     auto sequence = ReadU16(p, end);
     auto payloadSize = ReadU16(p, end);
     auto version = ReadU16(p, end);
-    if (!type || !sequence || !payloadSize || !version) {
+    auto ackFlag = ReadU8(p, end);
+    if (!type || !sequence || !payloadSize || !version || !ackFlag) {
         return ParseError::TooShort;
     }
 
@@ -294,11 +323,16 @@ inline ParseResult<Packet> parsePacket(const uint8_t* data, size_t size) {
     if (*version != PROTOCOL_VERSION) {
         return ParseError::BadVersion;
     }
+    if (*ackFlag > 1 ||
+        (*ackFlag == 1 && static_cast<CommandType>(*type) == CommandType::ACK)) {
+        return ParseError::BadAckFlag;
+    }
     if (HEADER_SIZE + *payloadSize != size) {
         return ParseError::LengthMismatch;
     }
 
-    PacketHeader header{static_cast<CommandType>(*type), *sequence, *payloadSize, *version};
+    PacketHeader header{
+        static_cast<CommandType>(*type), *sequence, *payloadSize, *version, *ackFlag == 1};
     return Packet{header, p};
 }
 
@@ -377,6 +411,24 @@ inline ParseResult<Pong> parsePong(const Packet& packet) {
         return ParseError::BadPayloadSize;
     }
     return Pong{*clientSendTimeUs, *serverReceiveTimeUs, *serverSendTimeUs};
+}
+
+// Второй этап разбора: payload должен быть ровно ACK_PAYLOAD_SIZE байт.
+inline ParseResult<Ack> parseAck(const Packet& packet) {
+    if (packet.header.type != CommandType::ACK) {
+        return ParseError::UnexpectedType;
+    }
+    if (packet.header.payloadSize != ACK_PAYLOAD_SIZE) {
+        return ParseError::BadPayloadSize;
+    }
+
+    const uint8_t* p = packet.payload;
+    const uint8_t* end = packet.payload + packet.header.payloadSize;
+    auto acknowledged = ReadU16(p, end);
+    if (!acknowledged || p != end) {
+        return ParseError::BadPayloadSize;
+    }
+    return Ack{*acknowledged};
 }
 
 // Текст ответа сервера (payload без завершающего нуля).
