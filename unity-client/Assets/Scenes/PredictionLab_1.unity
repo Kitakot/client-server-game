@@ -625,7 +625,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::PredictionClient
   serverIp: 127.0.0.1
-  serverPort: 54010
+  serverPort: 54000
   predictionEnabled: 1
   debugIgnoreObstacle: 0
 --- !u!4 &2107886130
