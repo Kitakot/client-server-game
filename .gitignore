@@ -17,5 +17,13 @@ _deps/
 CPackConfig.cmake
 CPackSourceConfig.cmake
 
+#Unity files
+unity-client/Library/
+unity-client/Temp/
+unity-client/Obj/
+unity-client/Logs/
+unity-client/UserSettings/
+unity-client/Builds/
+
 # Server log files
 server.log
