@@ -2,12 +2,15 @@
 #include "reliability/dedup_window.hpp"
 #include "transport/clock.hpp"
 #include "transport/udp_socket.hpp"
+#include "server/prediction_match.hpp"
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -45,6 +48,43 @@ int main() {
     std::unordered_map<std::uint64_t, DedupWindow> processed;  // клиент -> окно номеров
     std::unordered_map<std::int32_t, int> unitHp;
 
+    prediction::Match match;
+
+    // Слоты игроков нового пошагового матча.
+    std::array<std::optional<Endpoint>, 2> players;
+
+    uint32_t snapshotRevision = 0;
+    uint64_t nextSnapshotUs = 0;
+
+    auto findPlayer = [&](const Endpoint& endpoint) -> int {
+        for (int i = 0; i < 2; ++i) {
+            if (players[i] && *players[i] == endpoint) {
+                return i;
+            }
+        }
+
+        return -1;
+    };
+
+    auto broadcastWorld = [&]() {
+        ++snapshotRevision;
+
+        for (uint8_t player = 0; player < 2; ++player) {
+            if (!players[player]) {
+                continue;
+            }
+
+            socket.SendTo(
+                *players[player],
+                prediction::SerializeWorld(
+                    match.State(),
+                    player,
+                    snapshotRevision,
+                    match.Processed(player),
+                    match.LastResult(player)));
+        }
+    };
+
     // Некорректная датаграмма только журналируется; ответ на неё не
     // отправляется.
     auto dropDatagram = [&log](const Endpoint& from, std::size_t size, ParseError error) {
@@ -59,12 +99,19 @@ int main() {
     };
 
     while (true) {
+        const uint64_t nowUs = NowUs();
+
+        if (nowUs >= nextSnapshotUs) {
+            broadcastWorld();
+            nextSnapshotUs = nowUs + 100'000;
+        }
+
         uint8_t buffer[MAX_DATAGRAM_SIZE];
 
         // Адрес отправителя: на него уйдёт ответ.
         Endpoint client;
         auto received = socket.ReceiveFrom(
-            buffer, sizeof(buffer), client, std::chrono::milliseconds(1000));
+            buffer, sizeof(buffer), client, std::chrono::milliseconds(10));
         if (!received) {
             continue;
         }
@@ -79,6 +126,104 @@ int main() {
         }
         const Packet& packet = std::get<Packet>(parsed);
         const uint16_t sequence = packet.header.sequence;
+
+        if (packet.header.type == CommandType::HELLO) {
+            if (packet.header.payloadSize != 0 ||
+                packet.header.requiresAck) {
+                continue;
+            }
+
+            int player = findPlayer(client);
+
+            if (player < 0) {
+                for (int i = 0; i < 2; ++i) {
+                    if (!players[i]) {
+                        players[i] = client;
+                        player = i;
+
+                        std::cout
+                            << "[JOIN] player=" << player
+                            << " endpoint=" << ToString(client)
+                            << "\n";
+
+                        break;
+                    }
+                }
+            }
+
+            if (player >= 0) {
+                // В том числе отвечаем на повторный HELLO.
+                broadcastWorld();
+            } else {
+                std::cout
+                    << "[FULL] endpoint=" << ToString(client)
+                    << "\n";
+            }
+
+            continue;
+        }
+
+        if (packet.header.type == CommandType::TURN_INPUT) {
+            const int player = findPlayer(client);
+
+            if (player < 0) {
+                std::cout
+                    << "[DROP_INPUT] unregistered endpoint="
+                    << ToString(client)
+                    << "\n";
+                continue;
+            }
+
+            auto input = prediction::ParseInput(packet);
+
+            if (!input) {
+                std::cout << "[DROP_INPUT] malformed packet\n";
+                continue;
+            }
+
+            const uint8_t owner = static_cast<uint8_t>(player);
+
+            if (match.Process(owner, *input)) {
+                const auto result = match.LastResult(owner);
+                const auto& unit = match.State().units[owner];
+
+                std::cout
+                    << "[INPUT] player=" << player
+                    << " id=" << input->id
+                    << " result=" << static_cast<int>(result)
+                    << " position=(" << unit.x << "," << unit.y << ")"
+                    << " ap=" << unit.ap
+                    << " turn=" << match.State().turn
+                    << "\n";
+
+                if (log) {
+                    log
+                        << "prediction player=" << player
+                        << " input=" << input->id
+                        << " result=" << static_cast<int>(result)
+                        << " x=" << unit.x
+                        << " y=" << unit.y
+                        << " ap=" << unit.ap
+                        << " turn=" << match.State().turn
+                        << std::endl;
+                }
+
+                broadcastWorld();
+            } else {
+                std::cout
+                    << "[SKIP_INPUT] player=" << player
+                    << " id=" << input->id
+                    << " processed=" << match.Processed(owner)
+                    << "\n";
+            }
+
+            continue;
+        }
+
+        if (packet.header.type == CommandType::WORLD_STATE) {
+            // Клиент не имеет права задавать авторитетное состояние.
+            continue;
+        }
 
         if (packet.header.type == CommandType::PING) {
             auto ping = parsePing(packet);

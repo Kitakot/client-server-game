@@ -51,7 +51,10 @@ enum class CommandType : uint8_t {
     UNIT_ATTACK = 2,
     PING = 3,
     PONG = 4,
-    ACK = 5
+    ACK = 5,
+    HELLO = 6,
+    TURN_INPUT = 7,
+    WORLD_STATE = 8
 };
 
 inline bool isKnownCommandType(uint8_t value) {
@@ -61,6 +64,9 @@ inline bool isKnownCommandType(uint8_t value) {
         case CommandType::PING:
         case CommandType::PONG:
         case CommandType::ACK:
+        case CommandType::HELLO:
+        case CommandType::TURN_INPUT:
+        case CommandType::WORLD_STATE:
             return true;
     }
     return false;
