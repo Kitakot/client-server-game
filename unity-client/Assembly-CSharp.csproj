@@ -51,8 +51,10 @@
   <ItemGroup>
     <Compile Include="Assets\Scripts\PredictionLab.cs" />
     <Compile Include="Assets\Scripts\PredictionClient.cs" />
+    <Compile Include="Assets\Tests\EditMode\ReplicationCodecTests.cs" />
     <Compile Include="Assets\Scripts\StrategyRules.cs" />
     <Compile Include="Assets\TutorialInfo\Scripts\Readme.cs" />
+    <Compile Include="Assets\Scripts\ReplicationLabClient.cs" />
     <Compile Include="Assets\Scripts\LabUdp.cs" />
     <Compile Include="Assets\Scripts\PredictionModel.cs" />
   </ItemGroup>
