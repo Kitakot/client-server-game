@@ -3,6 +3,7 @@
 #include "transport/clock.hpp"
 #include "transport/udp_socket.hpp"
 #include "server/prediction_match.hpp"
+#include "server/prediction_lab.hpp"
 
 #include <array>
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -30,7 +32,7 @@ std::uint64_t ClientKey(const Endpoint& endpoint) {
     return (static_cast<std::uint64_t>(endpoint.address) << 16) | endpoint.port;
 }
 
-int main() {
+int main(int argc, char** argv) {
     UdpSocket socket;
     if (!socket.IsOpen()) {
         std::cerr << "Failed to create socket\n";
@@ -98,7 +100,30 @@ int main() {
         }
     };
 
+    std::unique_ptr<ReplicationLab> replicationLab;
+
+    if (argc > 1) {
+        if (argc != 4 || std::string(argv[1]) != "--replication") {
+            std::cerr
+                << "Usage: server "
+                << "[--repliation baseline|quantized|dirty|optimized output.csv]\n";
+            return 1;
+        }
+
+        try {
+            replicationLab = std::make_unique<ReplicationLab>(
+                argv[2], argv[3]);
+        } catch (const std::exception& error) {
+            std::cerr << "Failed to start replication lab: " << error.what() << "\n";
+            return 1;
+        }
+    }
+
     while (true) {
+        if (replicationLab) {
+            replicationLab->Tick();
+        }
+
         const uint64_t nowUs = NowUs();
 
         if (nowUs >= nextSnapshotUs) {
