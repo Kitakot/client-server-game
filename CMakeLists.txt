@@ -50,7 +50,9 @@ add_executable(tests
     tests/test_dedup_window.cpp
     tests/test_delivery_log.cpp
     tests/test_order_book.cpp
-    tests/test_prediction.cpp)
+    tests/test_prediction.cpp
+    tests/test_replication_lab.cpp
+    )
 target_link_libraries(tests PRIVATE protocol telemetry reliability Catch2::Catch2WithMain)
 
 enable_testing()
